@@ -1,7 +1,19 @@
-const console = require('./console');
-const JSZip = require('jszip');
-const kDefaultSettings = require('./default-settings');
-const PlaybackRateController = require('./playback-rate-controller');
+const console = require("./console");
+const JSZip = require("jszip");
+const kDefaultSettings = require("./default-settings");
+const PlaybackRateController = require("./playback-rate-controller");
+const { OpenAI } = require("openai");
+
+// 환경 변수에서 LLM 설정 로드 (빌드 시점에 주입됨)
+const LLM_API_BASE_URL =
+  process.env.LLM_API_BASE_URL || "http://localhost:1234/v1";
+const LLM_API_KEY = process.env.LLM_API_KEY || "not-needed";
+const LLM_MODEL_NAME = process.env.LLM_MODEL_NAME || "gemma-3-12b";
+const LLM_TARGET_LANGUAGE = process.env.LLM_TARGET_LANGUAGE || "Korean";
+const LLM_ENABLED = process.env.LLM_ENABLED === "true" ? true : false;
+
+// 번역 캐시 (같은 자막을 반복 번역하지 않도록)
+const translationCache = new Map();
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -20,7 +32,6 @@ const hookJsonParseAndAddCallback = function (_window) {
 };
 hookJsonParseAndAddCallback(window);
 
-
 // hook `history.pushState()` as there is not "pushstate" event in DOM API
 // Because Netflix preload manifests when the user hovers mouse over movies on index page,
 // our .updateManifest() won't be trigger after user clicks a movie to start watching (they must reload the player page)
@@ -32,21 +43,23 @@ hookJsonParseAndAddCallback(window);
     nflxMultiSubsManager.activateManifest(movieIdInUrl);
   }
 
-  history.pushState = (f => function pushState(state, ...args) {
-    f.call(history, state, ...args);
+  history.pushState = ((f) =>
+    function pushState(state, ...args) {
+      f.call(history, state, ...args);
 
-    processStateChange()
-  })(history.pushState);
+      processStateChange();
+    })(history.pushState);
 
   // Sometimes the URL captured by pushState does not contain the correct movieId, causing the manifest activation to fail.
   // This happens when there is a server-side redirect after starting playback, which doesn't trigger the pushState hook.
   // For example, a redirect happens after you click on a show thumbnail to start it instead of the play icon.
   // So we also hook history.replaceState to capture this redirect.
-  history.replaceState = (f => function replaceState(state, ...args) {
-    f.call(history, state, ...args);
+  history.replaceState = ((f) =>
+    function replaceState(state, ...args) {
+      f.call(history, state, ...args);
 
-    processStateChange()
-  })(history.replaceState);
+      processStateChange();
+    })(history.replaceState);
 })();
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -63,15 +76,14 @@ const extensionId = document.currentScript.id;
 function getMsgPort() {
   if (gMsgPort) return gMsgPort;
 
-  if (BROWSER !== 'safari') {
+  if (BROWSER !== "safari") {
     gMsgPort = chrome.runtime.connect(extensionId);
-  }
-  else {
+  } else {
     gMsgPort = browser.runtime.connect(extensionId);
   }
   console.log(`Linked: ${extensionId}`);
 
-  gMsgPort.onMessage.addListener(msg => {
+  gMsgPort.onMessage.addListener((msg) => {
     if (!msg.settings) return;
     gRenderOptions = Object.assign({}, msg.settings);
     gRendererLoop && gRendererLoop.setRenderDirty();
@@ -90,11 +102,11 @@ function getMsgPort() {
 }
 
 // connect with background script immediately to capture settings
-if (BROWSER !== 'firefox') {
+if (BROWSER !== "firefox") {
   try {
     getMsgPort();
   } catch (err) {
-    console.warn('Error: cannot talk to background,', err);
+    console.warn("Error: cannot talk to background,", err);
   }
 }
 
@@ -102,13 +114,13 @@ if (BROWSER !== 'firefox') {
 // connection (for applying settings) is relayed by our content script through
 // window.postMessage().
 
-if (BROWSER === 'firefox') {
+if (BROWSER === "firefox") {
   window.addEventListener(
-    'message',
-    evt => {
-      if (!evt.data || evt.data.namespace !== 'nflxmultisubs') return;
+    "message",
+    (evt) => {
+      if (!evt.data || evt.data.namespace !== "nflxmultisubs") return;
 
-      if (evt.data.action === 'apply-settings' && evt.data.settings) {
+      if (evt.data.action === "apply-settings" && evt.data.settings) {
         gRenderOptions = Object.assign({}, evt.data.settings);
         gRendererLoop && gRendererLoop.setRenderDirty();
       }
@@ -117,12 +129,15 @@ if (BROWSER === 'firefox') {
   );
 
   try {
-    window.postMessage({
-      namespace: 'nflxmultisubs',
-      action: 'connect'
-    }, '*');
+    window.postMessage(
+      {
+        namespace: "nflxmultisubs",
+        action: "connect",
+      },
+      "*"
+    );
   } catch (err) {
-    console.warn('Error: cannot talk to background,', err);
+    console.warn("Error: cannot talk to background,", err);
   }
 }
 
@@ -130,7 +145,7 @@ if (BROWSER === 'firefox') {
 
 class SubtitleBase {
   constructor(lang, bcp47, urls, isCaption) {
-    this.state = 'GENESIS';
+    this.state = "GENESIS";
     this.active = false;
     this.lang = lang;
     this.bcp47 = bcp47;
@@ -145,11 +160,11 @@ class SubtitleBase {
   activate(options) {
     return new Promise((resolve, reject) => {
       this.active = true;
-      if (this.state === 'GENESIS') {
-        this.state = 'LOADING';
+      if (this.state === "GENESIS") {
+        this.state = "LOADING";
         console.log(`Subtitle "${this.lang}" downloading`);
         this._download().then(() => {
-          this.state = 'READY';
+          this.state = "READY";
           console.log(`Subtitle "${this.lang}" loaded`);
           resolve(this);
         });
@@ -162,12 +177,12 @@ class SubtitleBase {
   }
 
   render(seconds, options, forced) {
-    if (!this.active || this.state !== 'READY' || !this.lines) return [];
+    if (!this.active || this.state !== "READY" || !this.lines) return [];
     const lines = this.lines.filter(
-      line => line.begin <= seconds && seconds <= line.end
+      (line) => line.begin <= seconds && seconds <= line.end
     );
     const ids = lines
-      .map(line => line.id)
+      .map((line) => line.id)
       .sort()
       .toString();
 
@@ -187,12 +202,14 @@ class SubtitleBase {
   _download() {
     if (!this.urls) return Promise.resolve();
 
-    console.debug('Selecting fastest server, candidates: ',
-      this.urls.map(u => u.substr(0, 24)));
+    console.debug(
+      "Selecting fastest server, candidates: ",
+      this.urls.map((u) => u.substr(0, 24))
+    );
 
     return Promise.any(
-      this.urls.map(url => fetch(url, { method: 'HEAD' }))
-    ).then(r => {
+      this.urls.map((url) => fetch(url, { method: "HEAD" }))
+    ).then((r) => {
       const url = r.url;
       console.debug(`Fastest: ${url.substr(0, 24)}`);
       return this._extract(fetch(url));
@@ -211,7 +228,7 @@ class SubtitleBase {
 
 class DummySubtitle extends SubtitleBase {
   constructor() {
-    super('Off');
+    super("Off");
   }
 
   activate() {
@@ -232,37 +249,124 @@ class DehydratedSubtitle extends SubtitleBase {
   }
 }
 
+// LLM 번역 함수
+async function translateTextWithLLM(
+  textContent,
+  targetLanguage = LLM_TARGET_LANGUAGE
+) {
+  if (!textContent || !textContent.trim()) {
+    return "";
+  }
+
+  // 캐시 확인
+  const cacheKey = `${textContent}_${targetLanguage}`;
+  if (translationCache.has(cacheKey)) {
+    return translationCache.get(cacheKey);
+  }
+
+  try {
+    console.log("Translating text with LLM:", textContent);
+    const translatedText = await callLLMForTranslation(
+      textContent,
+      targetLanguage
+    );
+
+    // 캐시에 저장
+    translationCache.set(cacheKey, translatedText);
+
+    // 캐시 크기 제한 (메모리 관리)
+    if (translationCache.size > 500) {
+      const firstKey = translationCache.keys().next().value;
+      translationCache.delete(firstKey);
+    }
+
+    return translatedText;
+  } catch (error) {
+    console.error("Translation error:", error);
+    return textContent; // 번역 실패 시 원본 반환
+  }
+}
+
+async function callLLMForTranslation(textContent, targetLanguage) {
+  const openai = new OpenAI({
+    baseURL: LLM_API_BASE_URL,
+    apiKey: LLM_API_KEY,
+    dangerouslyAllowBrowser: true,
+  });
+
+  const prompt = `Translate the following subtitle text to ${targetLanguage}. 
+Only return the translated text without any explanation or additional text.
+Keep the same line breaks if present.
+
+Text to translate:
+${textContent}`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: LLM_MODEL_NAME,
+      messages: [
+        {
+          role: "system",
+          content: `You are a professional subtitle translator. Translate accurately and naturally to ${targetLanguage}. Only output the translation, nothing else.`,
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      max_tokens: 500,
+      temperature: 0.3, // 낮은 temperature로 일관된 번역
+    });
+
+    const translatedText = response.choices[0].message.content.trim();
+    console.log("Translation result:", translatedText);
+    return translatedText;
+  } catch (error) {
+    console.error("LLM API Error:", error);
+    console.error(
+      "LLM Server URL:",
+      LLM_API_BASE_URL,
+      "Model:",
+      LLM_MODEL_NAME
+    );
+    throw error;
+  }
+}
+
 class TextSubtitle extends SubtitleBase {
   constructor(...args) {
     super(...args);
+    this.lastRenderedText = undefined;
+    this.pendingTranslation = null;
+    this.lastTranslatedResult = null;
   }
 
   _extract(fetchPromise) {
     return new Promise((resolve, reject) => {
       fetchPromise
-        .then(r => r.text())
-        .then(xmlText => {
-          const xml = new DOMParser().parseFromString(xmlText, 'text/xml');
+        .then((r) => r.text())
+        .then((xmlText) => {
+          const xml = new DOMParser().parseFromString(xmlText, "text/xml");
 
-          const LINE_SELECTOR = 'tt > body > div > p';
+          const LINE_SELECTOR = "tt > body > div > p";
           const lines = [].map.call(
             xml.querySelectorAll(LINE_SELECTOR),
             (line, id) => {
-              let text = '';
-              let extractTextRecur = parentNode => {
-                [].forEach.call(parentNode.childNodes, node => {
+              let text = "";
+              let extractTextRecur = (parentNode) => {
+                [].forEach.call(parentNode.childNodes, (node) => {
                   if (node.nodeType === Node.ELEMENT_NODE)
-                    if (node.nodeName.toLowerCase() === 'br') text += '\n';
+                    if (node.nodeName.toLowerCase() === "br") text += "\n";
                     else extractTextRecur(node);
                   else if (node.nodeType === Node.TEXT_NODE)
-                    text += node.nodeValue + ' ';
+                    text += node.nodeValue + " ";
                 });
               };
               extractTextRecur(line);
 
               // convert microseconds to seconds
-              const begin = parseInt(line.getAttribute('begin')) / 10000000;
-              const end = parseInt(line.getAttribute('end')) / 10000000;
+              const begin = parseInt(line.getAttribute("begin")) / 10000000;
+              const end = parseInt(line.getAttribute("end")) / 10000000;
               return { id, begin, end, text };
             }
           );
@@ -280,39 +384,123 @@ class TextSubtitle extends SubtitleBase {
     // .join('\n').split('\n') seems redundant but it's done because speaker-based captions will not contain a \n to
     // indicate line breaks, instead they will come as individual elements in the lines array. Regular captions will
     // come as a single element with a \n. So this is to make sure all caption formats are split into lines correctly.
-    const textContent = lines.map(line => line.text).join('\n').split('\n');
-    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    text.setAttributeNS(null, 'text-anchor', 'middle');
-    text.setAttributeNS(null, 'alignment-baseline', 'hanging');
-    text.setAttributeNS(null, 'dominant-baseline', 'hanging'); // firefox
-    text.setAttributeNS(null, 'paint-order', 'stroke');
-    text.setAttributeNS(null, 'stroke', 'black');
+    const textContent = lines
+      .map((line) => line.text)
+      .join("\n")
+      .split("\n");
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.setAttributeNS(null, "text-anchor", "middle");
+    text.setAttributeNS(null, "alignment-baseline", "hanging");
+    text.setAttributeNS(null, "dominant-baseline", "hanging"); // firefox
+    text.setAttributeNS(null, "paint-order", "stroke");
+    text.setAttributeNS(null, "stroke", "black");
     text.setAttributeNS(
       null,
-      'stroke-width',
+      "stroke-width",
       `${1.0 * options.secondaryTextStroke}px`
     );
-    text.setAttributeNS(null, 'x', this.extentWidth * 0.5);
+    text.setAttributeNS(null, "x", this.extentWidth * 0.5);
     text.setAttributeNS(
       null,
-      'y',
+      "y",
       this.extentHeight * (options.lowerBaselinePos + 0.01)
     );
-    text.setAttributeNS(null, 'opacity', options.secondaryTextOpacity);
+    text.setAttributeNS(null, "opacity", options.secondaryTextOpacity);
     text.style.fontSize = `${fontSize * options.secondaryTextScale}px`;
-    text.style.fontFamily = 'Arial, Helvetica';
+    text.style.fontFamily = "Arial, Helvetica";
     text.style.fill = options.secondaryTextColor;
-    text.style.stroke = 'black';
+    text.style.stroke = "black";
 
     // tspan for line breaks
     textContent.forEach((line, i) => {
-      const tspan = document.createElementNS("http://www.w3.org/2000/svg", "tspan");
-      tspan.setAttributeNS(null, 'x', this.extentWidth * 0.5);
-      if (i > 0) tspan.setAttributeNS(null, 'dy', text.style.fontSize);
+      const tspan = document.createElementNS(
+        "http://www.w3.org/2000/svg",
+        "tspan"
+      );
+      tspan.setAttributeNS(null, "x", this.extentWidth * 0.5);
+      if (i > 0) tspan.setAttributeNS(null, "dy", text.style.fontSize);
       tspan.textContent = line;
       text.appendChild(tspan);
     });
 
+    return [text];
+  }
+
+  // LLM 번역을 사용하는 비동기 렌더링 메서드
+  async renderWithTranslation(seconds, options, forced) {
+    if (!this.active || this.state !== "READY" || !this.lines) return [];
+
+    const lines = this.lines.filter(
+      (line) => line.begin <= seconds && seconds <= line.end
+    );
+
+    if (lines.length === 0) {
+      this.lastRenderedText = undefined;
+      return [];
+    }
+
+    const textContent = lines.map((line) => line.text).join("\n");
+
+    // 같은 텍스트면 이전 결과 반환
+    if (
+      this.lastRenderedText === textContent &&
+      this.lastTranslatedResult &&
+      !forced
+    ) {
+      return null; // null은 변경 없음을 의미
+    }
+
+    this.lastRenderedText = textContent;
+
+    // 번역 수행
+    let displayText = textContent;
+    if (LLM_ENABLED) {
+      try {
+        displayText = await translateTextWithLLM(textContent);
+      } catch (error) {
+        console.error("Translation failed, using original text:", error);
+      }
+    }
+
+    // 렌더링
+    const fontSize = Math.ceil(this.extentHeight / 30);
+    const textLines = displayText.split("\n");
+
+    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    text.setAttributeNS(null, "text-anchor", "middle");
+    text.setAttributeNS(null, "alignment-baseline", "hanging");
+    text.setAttributeNS(null, "dominant-baseline", "hanging");
+    text.setAttributeNS(null, "paint-order", "stroke");
+    text.setAttributeNS(null, "stroke", "black");
+    text.setAttributeNS(
+      null,
+      "stroke-width",
+      `${1.0 * options.secondaryTextStroke}px`
+    );
+    text.setAttributeNS(null, "x", this.extentWidth * 0.5);
+    text.setAttributeNS(
+      null,
+      "y",
+      this.extentHeight * (options.lowerBaselinePos + 0.01)
+    );
+    text.setAttributeNS(null, "opacity", options.secondaryTextOpacity);
+    text.style.fontSize = `${fontSize * options.secondaryTextScale}px`;
+    text.style.fontFamily = "Arial, Helvetica";
+    text.style.fill = options.secondaryTextColor;
+    text.style.stroke = "black";
+
+    textLines.forEach((line, i) => {
+      const tspan = document.createElementNS(
+        "http://www.w3.org/2000/svg",
+        "tspan"
+      );
+      tspan.setAttributeNS(null, "x", this.extentWidth * 0.5);
+      if (i > 0) tspan.setAttributeNS(null, "dy", text.style.fontSize);
+      tspan.textContent = line;
+      text.appendChild(tspan);
+    });
+
+    this.lastTranslatedResult = [text];
     return [text];
   }
 }
@@ -325,35 +513,33 @@ class ImageSubtitle extends SubtitleBase {
 
   _extract(fetchPromise) {
     return new Promise((resolve, reject) => {
-      const unzipP = fetchPromise.then(r => r.blob()).then(zipBlob => new JSZip().loadAsync(zipBlob));
-      unzipP.then(zip => {
+      const unzipP = fetchPromise
+        .then((r) => r.blob())
+        .then((zipBlob) => new JSZip().loadAsync(zipBlob));
+      unzipP.then((zip) => {
         zip
-          .file('manifest_ttml2.xml')
-          .async('string')
-          .then(xmlText => {
-            const xml = new DOMParser().parseFromString(xmlText, 'text/xml');
+          .file("manifest_ttml2.xml")
+          .async("string")
+          .then((xmlText) => {
+            const xml = new DOMParser().parseFromString(xmlText, "text/xml");
 
             // dealing with `ns2:extent`, `ns3:extent`, ...
             const _getAttributeAnyNS = (domNode, attrName) => {
-              const name = domNode.getAttributeNames().find(
-                n =>
-                  n
-                    .split(':')
-                    .pop()
-                    .toLowerCase() === attrName
-              );
+              const name = domNode
+                .getAttributeNames()
+                .find((n) => n.split(":").pop().toLowerCase() === attrName);
               return domNode.getAttribute(name);
             };
 
             const extent = _getAttributeAnyNS(
-              xml.querySelector('tt'),
-              'extent'
+              xml.querySelector("tt"),
+              "extent"
             );
             [this.extentWidth, this.extentHeight] = extent
-              .split(' ')
-              .map(n => parseInt(n));
+              .split(" ")
+              .map((n) => parseInt(n));
 
-            const _ttmlTimeToSeconds = timestamp => {
+            const _ttmlTimeToSeconds = (timestamp) => {
               // e.g., _ttmlTimeToSeconds('00:00:06.005') -> 6.005
               const regex = /(\d+):(\d+):(\d+(?:\.\d+)?)/;
               const [hh, mm, sssss] = regex
@@ -363,29 +549,25 @@ class ImageSubtitle extends SubtitleBase {
               return hh * 3600 + mm * 60 + sssss;
             };
 
-            const LINE_SELECTOR = 'tt > body > div';
+            const LINE_SELECTOR = "tt > body > div";
             const lines = [].map.call(
               xml.querySelectorAll(LINE_SELECTOR),
               (line, id) => {
-                const extentAttrName = line.getAttributeNames().find(
-                  n =>
-                    n
-                      .split(':')
-                      .pop()
-                      .toLowerCase() === 'extent'
-                );
+                const extentAttrName = line
+                  .getAttributeNames()
+                  .find((n) => n.split(":").pop().toLowerCase() === "extent");
 
-                const [width, height] = _getAttributeAnyNS(line, 'extent')
-                  .split(' ')
-                  .map(n => parseInt(n));
-                const [left, top] = _getAttributeAnyNS(line, 'origin')
-                  .split(' ')
-                  .map(n => parseInt(n));
+                const [width, height] = _getAttributeAnyNS(line, "extent")
+                  .split(" ")
+                  .map((n) => parseInt(n));
+                const [left, top] = _getAttributeAnyNS(line, "origin")
+                  .split(" ")
+                  .map((n) => parseInt(n));
                 const imageName = line
-                  .querySelector('image')
-                  .getAttribute('src');
-                const begin = _ttmlTimeToSeconds(line.getAttribute('begin'));
-                const end = _ttmlTimeToSeconds(line.getAttribute('end'));
+                  .querySelector("image")
+                  .getAttribute("src");
+                const begin = _ttmlTimeToSeconds(line.getAttribute("begin"));
+                const end = _ttmlTimeToSeconds(line.getAttribute("end"));
                 return { id, width, height, top, left, imageName, begin, end };
               }
             );
@@ -403,28 +585,31 @@ class ImageSubtitle extends SubtitleBase {
     const centerLine = this.extentHeight * 0.5;
     const upperBaseline = this.extentHeight * options.upperBaselinePos;
     const lowerBaseline = this.extentHeight * options.lowerBaselinePos;
-    return lines.map(line => {
+    return lines.map((line) => {
       const img = document.createElementNS(
-        'http://www.w3.org/2000/svg',
-        'image'
+        "http://www.w3.org/2000/svg",
+        "image"
       );
       this.zip
         .file(line.imageName)
-        .async('blob')
-        .then(blob => {
+        .async("blob")
+        .then((blob) => {
           const { left, top, width, height } = line;
           const [newWidth, newHeight] = [width * scale, height * scale];
           const newLeft = left + 0.5 * (width - newWidth);
-          const newTop = top <= centerLine ? upperBaseline + gSecondaryOffset : lowerBaseline;
+          const newTop =
+            top <= centerLine
+              ? upperBaseline + gSecondaryOffset
+              : lowerBaseline;
 
           const src = URL.createObjectURL(blob);
-          img.setAttributeNS('http://www.w3.org/1999/xlink', 'href', src);
-          img.setAttributeNS(null, 'width', newWidth);
-          img.setAttributeNS(null, 'height', newHeight);
-          img.setAttributeNS(null, 'x', newLeft);
-          img.setAttributeNS(null, 'y', newTop);
-          img.setAttributeNS(null, 'opacity', options.secondaryImageOpacity);
-          img.addEventListener('load', () => {
+          img.setAttributeNS("http://www.w3.org/1999/xlink", "href", src);
+          img.setAttributeNS(null, "width", newWidth);
+          img.setAttributeNS(null, "height", newHeight);
+          img.setAttributeNS(null, "x", newLeft);
+          img.setAttributeNS(null, "y", newTop);
+          img.setAttributeNS(null, "opacity", options.secondaryImageOpacity);
+          img.addEventListener("load", () => {
             URL.revokeObjectURL(src);
           });
         });
@@ -438,9 +623,11 @@ class ImageSubtitle extends SubtitleBase {
 class SubtitleFactory {
   // track: manifest.textTracks[...]
   static build(track) {
-    const isImageBased = Object.values(track.ttDownloadables).some(d => d.isImage);
-    const isCaption = track.rawTrackType === 'closedcaptions';
-    const lang = track.languageDescription + (isCaption ? ' [CC]' : '');
+    const isImageBased = Object.values(track.ttDownloadables).some(
+      (d) => d.isImage
+    );
+    const isCaption = track.rawTrackType === "closedcaptions";
+    const lang = track.languageDescription + (isCaption ? " [CC]" : "");
     const bcp47 = track.language;
 
     if (!track.hydrated) {
@@ -464,13 +651,11 @@ class SubtitleFactory {
     // "new_track_id" example "T:1:0;1;zh-Hant;1;1;"
     // the last bit is 1 for NoneTrack text tracks
     try {
-      const isNoneTrackBit = track.new_track_id.split(';')[4];
-      if (isNoneTrackBit === '1') {
+      const isNoneTrackBit = track.new_track_id.split(";")[4];
+      if (isNoneTrackBit === "1") {
         return true;
       }
-    }
-    catch (err) {
-    }
+    } catch (err) {}
 
     // "rank" === -1
     if (track.rank !== undefined && track.rank < 0) {
@@ -480,24 +665,26 @@ class SubtitleFactory {
   }
 
   static _buildImageBased(track, lang, bcp47, isCaption) {
-    const maxHeight = Math.max(...Object.values(track.ttDownloadables).map(d => {
-      if (d.height)
-        return d.height;
-      else
-        return -1;
-    }));
-    const d = Object.values(track.ttDownloadables).find(d => d.height === maxHeight);
+    const maxHeight = Math.max(
+      ...Object.values(track.ttDownloadables).map((d) => {
+        if (d.height) return d.height;
+        else return -1;
+      })
+    );
+    const d = Object.values(track.ttDownloadables).find(
+      (d) => d.height === maxHeight
+    );
     let urls;
     if (d.downloadUrls) {
       urls = Object.values(d.downloadUrls);
     } else {
-      urls = d.urls.map(t => t.url);
+      urls = d.urls.map((t) => t.url);
     }
     return new ImageSubtitle(lang, bcp47, urls, isCaption);
   }
 
   static _buildTextBased(track, lang, bcp47, isCaption) {
-    const targetProfile = 'dfxp-ls-sdh';
+    const targetProfile = "dfxp-ls-sdh";
     const d = track.ttDownloadables[targetProfile];
     if (!d) {
       console.debug(`Cannot find "${targetProfile}" for ${lang}`);
@@ -507,30 +694,30 @@ class SubtitleFactory {
     if (d.downloadUrls) {
       urls = Object.values(d.downloadUrls);
     } else {
-      urls = d.urls.map(t => t.url);
+      urls = d.urls.map((t) => t.url);
     }
     return new TextSubtitle(lang, bcp47, urls, isCaption);
   }
 }
 
 // textTracks: manifest.textTracks
-const buildSubtitleList = textTracks => {
+const buildSubtitleList = (textTracks) => {
   const dummy = new DummySubtitle();
   dummy.activate();
 
   // sorted by language in alphabetical order (to align with official UI)
   const subs = textTracks
-    .filter(t => !SubtitleFactory.isNoneTrack(t))
-    .map(t => SubtitleFactory.build(t))
-    .filter(t => t !== null);
+    .filter((t) => !SubtitleFactory.isNoneTrack(t))
+    .map((t) => SubtitleFactory.build(t))
+    .filter((t) => t !== null);
   return subs.concat(dummy);
 };
 
 // textTracks: manifest.textTracks
 const updateSubtitleList = (textTracks, textTrackId) => {
-  const track = textTracks.find(t => t.new_track_id == textTrackId),
+  const track = textTracks.find((t) => t.new_track_id == textTrackId),
     sub = SubtitleFactory.build(track),
-    index = gSubtitles.findIndex(s => s.lang == sub.lang);
+    index = gSubtitles.findIndex((s) => s.lang == sub.lang);
   if (gSubtitles[index] instanceof DehydratedSubtitle && sub !== null) {
     gSubtitles[index] = sub;
     gSubtitleMenu && gSubtitleMenu.render();
@@ -539,32 +726,45 @@ const updateSubtitleList = (textTracks, textTrackId) => {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-const SUBTITLE_LIST_CLASSNAME = 'nflxmultisubs-subtitle-list';
-const SUB_MENU_SELECTOR = 'selector-audio-subtitle';
+const SUBTITLE_LIST_CLASSNAME = "nflxmultisubs-subtitle-list";
+const SUB_MENU_SELECTOR = "selector-audio-subtitle";
 class SubtitleMenu {
   constructor(node) {
-    this.style = this.extractStyle(node)
-    this.elem = document.createElement('div');
-    this.elem.classList.add(this.style.maindiv, 'structural', 'track-list-subtitles');
+    this.style = this.extractStyle(node);
+    this.elem = document.createElement("div");
+    this.elem.classList.add(
+      this.style.maindiv,
+      "structural",
+      "track-list-subtitles"
+    );
     this.elem.classList.add(SUBTITLE_LIST_CLASSNAME);
   }
 
   extractStyle(node) {
     // get class names of all the sub menu elements
     // so we can apply them to our menu and copy their style
-    const style = { maindiv: null, subdiv: null, h3: null, ul: null, li: null, selected: null }
-    const mainNode = node.querySelector(`div[data-uia=${SUB_MENU_SELECTOR}]`)
+    const style = {
+      maindiv: null,
+      subdiv: null,
+      h3: null,
+      ul: null,
+      li: null,
+      selected: null,
+    };
+    const mainNode = node.querySelector(`div[data-uia=${SUB_MENU_SELECTOR}]`);
 
     if (!mainNode) return style;
 
     style.maindiv = mainNode.firstChild?.className;
-    style.subdiv = mainNode.querySelector('li div div')?.className;
-    style.h3 = mainNode.querySelector('h3')?.className;
-    style.ul = mainNode.querySelector('ul')?.className;
-    style.li = mainNode.querySelector('li')?.className;
-    style.selected = mainNode.querySelector('li[data-uia*="selected"] svg')?.className?.baseVal; // Netflix fuckery
+    style.subdiv = mainNode.querySelector("li div div")?.className;
+    style.h3 = mainNode.querySelector("h3")?.className;
+    style.ul = mainNode.querySelector("ul")?.className;
+    style.li = mainNode.querySelector("li")?.className;
+    style.selected = mainNode.querySelector(
+      'li[data-uia*="selected"] svg'
+    )?.className?.baseVal; // Netflix fuckery
 
-    return style
+    return style;
   }
 
   render() {
@@ -578,27 +778,27 @@ class SubtitleMenu {
 
     this.elem.innerHTML = `<h3 class="${this.style.h3}">Secondary Subtitles</h3>`;
 
-    const listElem = document.createElement('ul');
+    const listElem = document.createElement("ul");
     gSubtitles.forEach((sub, id) => {
       if (sub instanceof DehydratedSubtitle) return;
-      let item = document.createElement('li');
+      let item = document.createElement("li");
       item.classList.add(this.style.li);
       if (sub.active) {
-        const icon = sub.state === 'LOADING' ? loadingIcon : checkIcon;
-        item.classList.add('selected');
+        const icon = sub.state === "LOADING" ? loadingIcon : checkIcon;
+        item.classList.add("selected");
         item.innerHTML = `<div>${icon}<div class="${this.style.subdiv}">${sub.lang}</div></div>`;
       } else {
         item.innerHTML = `<div><div class="${this.style.subdiv}">${sub.lang}</div></div>`;
-        item.addEventListener('click', () => {
+        item.addEventListener("click", () => {
           activateSubtitle(id);
         });
       }
       listElem.classList.add(this.style.ul);
       listElem.appendChild(item);
     });
-    const listWrapper = document.createElement('div');
-    listWrapper.style.overflowY = 'auto';
-    listWrapper.style.overflowX = 'hidden';
+    const listWrapper = document.createElement("div");
+    listWrapper.style.overflowY = "auto";
+    listWrapper.style.overflowX = "hidden";
     listWrapper.appendChild(listElem);
     this.elem.appendChild(listWrapper);
   }
@@ -606,9 +806,9 @@ class SubtitleMenu {
 
 // -----------------------------------------------------------------------------
 
-const isPopupMenuElement = node => {
+const isPopupMenuElement = (node) => {
   return (
-    node.nodeName.toLowerCase() === 'div' &&
+    node.nodeName.toLowerCase() === "div" &&
     node.querySelector(`div[data-uia=${SUB_MENU_SELECTOR}]`)
   );
 };
@@ -616,9 +816,9 @@ const isPopupMenuElement = node => {
 // FIXME: can we disconnect this observer once our menu is injected ?
 // we still don't know whether Netflix would re-build the pop-up menu after
 // switching to next episodes
-const bodyObserver = new MutationObserver(mutations => {
-  mutations.forEach(mutation => {
-    mutation.addedNodes.forEach(node => {
+const bodyObserver = new MutationObserver((mutations) => {
+  mutations.forEach((mutation) => {
+    mutation.addedNodes.forEach((node) => {
       if (isPopupMenuElement(node)) {
         // popup menu attached
         if (!node.getElementsByClassName(SUBTITLE_LIST_CLASSNAME).length) {
@@ -628,11 +828,13 @@ const bodyObserver = new MutationObserver(mutations => {
           }
           node.style.left = "auto";
           node.style.right = "10px";
-          node.querySelector(`div[data-uia=${SUB_MENU_SELECTOR}]`).appendChild(gSubtitleMenu.elem);
+          node
+            .querySelector(`div[data-uia=${SUB_MENU_SELECTOR}]`)
+            .appendChild(gSubtitleMenu.elem);
         }
       }
     });
-    mutation.removedNodes.forEach(node => {
+    mutation.removedNodes.forEach((node) => {
       if (isPopupMenuElement(node)) {
         // popup menu detached
       }
@@ -643,66 +845,72 @@ const observerOptions = {
   attributes: true,
   subtree: true,
   childList: true,
-  characterData: true
+  characterData: true,
 };
 bodyObserver.observe(document.body, observerOptions);
 
 ////////////////////////////////////////////////////////////////////////////////
 
-activateSubtitle = id => {
+activateSubtitle = (id) => {
   const sub = gSubtitles[id];
   if (sub) {
-    gSubtitles.forEach(sub => sub.deactivate());
-    sub.activate().then(() => { gSubtitleMenu && gSubtitleMenu.render(); });
+    gSubtitles.forEach((sub) => sub.deactivate());
+    sub.activate().then(() => {
+      gSubtitleMenu && gSubtitleMenu.render();
+    });
 
     gRenderOptions.secondaryLanguageLastUsed = sub.bcp47;
     gRenderOptions.secondaryLanguageLastUsedIsCaption = sub.isCaption;
 
-    if (BROWSER !== 'firefox') {
+    if (BROWSER !== "firefox") {
       try {
         getMsgPort().postMessage({ settings: gRenderOptions });
       } catch (err) {
-        console.warn('Cannot dispatch settings,', err);
+        console.warn("Cannot dispatch settings,", err);
       }
     } else {
       // Firefox
       try {
-        window.postMessage({
-          namespace: 'nflxmultisubs',
-          action: 'update-settings',
-          settings: gRenderOptions
-        }, '*');
+        window.postMessage(
+          {
+            namespace: "nflxmultisubs",
+            action: "update-settings",
+            settings: gRenderOptions,
+          },
+          "*"
+        );
       } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
+        console.warn("Error: cannot talk to background,", err);
       }
     }
   }
   gSubtitleMenu && gSubtitleMenu.render();
 };
 
-const buildSecondarySubtitleElement = options => {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.classList.add('nflxmultisubs-subtitle-svg');
+const buildSecondarySubtitleElement = (options) => {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.classList.add("nflxmultisubs-subtitle-svg");
   svg.style =
-    'position:absolute; width:100%; top:0; bottom:0; left:0; right:0;';
-  svg.setAttributeNS(null, 'width', '100%');
-  svg.setAttributeNS(null, 'height', '100%');
+    "position:absolute; width:100%; top:0; bottom:0; left:0; right:0;";
+  svg.setAttributeNS(null, "width", "100%");
+  svg.setAttributeNS(null, "height", "100%");
 
-  const padding = document.createElement('div');
-  padding.classList.add('nflxmultisubs-subtitle-padding');
-  padding.style = `display:block; content:' '; width:100%; padding-top:${gVideoRatio *
-    100}%;`;
+  const padding = document.createElement("div");
+  padding.classList.add("nflxmultisubs-subtitle-padding");
+  padding.style = `display:block; content:' '; width:100%; padding-top:${
+    gVideoRatio * 100
+  }%;`;
 
-  const container = document.createElement('div');
-  container.classList.add('nflxmultisubs-subtitle-container');
-  container.style = 'position:relative; width:100%; max-height:100%;';
+  const container = document.createElement("div");
+  container.classList.add("nflxmultisubs-subtitle-container");
+  container.style = "position:relative; width:100%; max-height:100%;";
   container.appendChild(svg);
   container.appendChild(padding);
 
-  const wrapper = document.createElement('div');
-  wrapper.classList.add('nflxmultisubs-subtitle-wrapper');
+  const wrapper = document.createElement("div");
+  wrapper.classList.add("nflxmultisubs-subtitle-wrapper");
   wrapper.style =
-    'position:absolute; top:0; left:0; width:100%; height:100%; z-index:2; display:flex; align-items:center;';
+    "position:absolute; top:0; left:0; width:100%; height:100%; z-index:2; display:flex; align-items:center;";
   wrapper.appendChild(container);
   return wrapper;
 };
@@ -710,17 +918,17 @@ const buildSecondarySubtitleElement = options => {
 // -----------------------------------------------------------------------------
 
 class PrimaryImageTransformer {
-  constructor() { }
+  constructor() {}
 
   transform(svgElem, controlsActive, forced) {
-    const selector = forced ? 'image' : 'image:not(.nflxmultisubs-scaled)';
+    const selector = forced ? "image" : "image:not(.nflxmultisubs-scaled)";
     const images = svgElem.querySelectorAll(selector);
     if (images.length > 0) {
-      const viewBox = svgElem.getAttributeNS(null, 'viewBox');
+      const viewBox = svgElem.getAttributeNS(null, "viewBox");
       const [extentWidth, extentHeight] = viewBox
-        .split(' ')
+        .split(" ")
         .slice(-2)
-        .map(n => parseInt(n));
+        .map((n) => parseInt(n));
 
       // TODO: if there's no secondary subtitle, center the primary on baseline
       const options = gRenderOptions;
@@ -731,32 +939,32 @@ class PrimaryImageTransformer {
       const opacity = options.primaryImageOpacity;
       const color = options.primaryTextColor;
 
-      [].forEach.call(images, img => {
-        img.classList.add('nflxmultisubs-scaled');
+      [].forEach.call(images, (img) => {
+        img.classList.add("nflxmultisubs-scaled");
         const left = parseInt(
-          img.getAttributeNS(null, 'data-orig-x') ||
-          img.getAttributeNS(null, 'x')
+          img.getAttributeNS(null, "data-orig-x") ||
+            img.getAttributeNS(null, "x")
         );
         const top = parseInt(
-          img.getAttributeNS(null, 'data-orig-y') ||
-          img.getAttributeNS(null, 'y')
+          img.getAttributeNS(null, "data-orig-y") ||
+            img.getAttributeNS(null, "y")
         );
         const width = parseInt(
-          img.getAttributeNS(null, 'data-orig-width') ||
-          img.getAttributeNS(null, 'width')
+          img.getAttributeNS(null, "data-orig-width") ||
+            img.getAttributeNS(null, "width")
         );
         const height = parseInt(
-          img.getAttributeNS(null, 'data-orig-height') ||
-          img.getAttributeNS(null, 'height')
+          img.getAttributeNS(null, "data-orig-height") ||
+            img.getAttributeNS(null, "height")
         );
 
         const attribs = [
-          ['x', left],
-          ['y', top],
-          ['width', width],
-          ['height', height]
+          ["x", left],
+          ["y", top],
+          ["width", width],
+          ["height", height],
         ];
-        attribs.forEach(p => {
+        attribs.forEach((p) => {
           const attrName = `data-orig-${p[0]}`,
             attrValue = p[1];
           if (!img.getAttributeNS(null, attrName)) {
@@ -776,27 +984,27 @@ class PrimaryImageTransformer {
 
         if (top <= centerLine) {
           if (upperBaseline - newHeight <= 0) {
-            newTop = upperBaseline - newHeight / 2
-            gSecondaryOffset = newHeight / 2
+            newTop = upperBaseline - newHeight / 2;
+            gSecondaryOffset = newHeight / 2;
           } else {
-            newTop = upperBaseline - newHeight
-            gSecondaryOffset = 0
+            newTop = upperBaseline - newHeight;
+            gSecondaryOffset = 0;
           }
         } else {
-          newTop = lowerBaseline - newHeight
-          gSecondaryOffset = 0
+          newTop = lowerBaseline - newHeight;
+          gSecondaryOffset = 0;
         }
 
         // if it somehow still ends up negative just hard-constrain it
         // (we arbitrarily choose 10 to give it some space from the screen edge)
-        newTop = (newTop <= 0) ? 10 : newTop;
+        newTop = newTop <= 0 ? 10 : newTop;
 
-        img.setAttributeNS(null, 'width', newWidth);
-        img.setAttributeNS(null, 'height', newHeight);
-        img.setAttributeNS(null, 'x', newLeft);
-        img.setAttributeNS(null, 'y', newTop);
-        img.setAttributeNS(null, 'opacity', opacity);
-        img.setAttributeNS(null, 'color', color);
+        img.setAttributeNS(null, "width", newWidth);
+        img.setAttributeNS(null, "height", newHeight);
+        img.setAttributeNS(null, "x", newLeft);
+        img.setAttributeNS(null, "y", newTop);
+        img.setAttributeNS(null, "opacity", opacity);
+        img.setAttributeNS(null, "color", color);
       });
     }
   }
@@ -809,14 +1017,14 @@ class PrimaryTextTransformer {
 
   transform(divElem, controlsActive, forced) {
     let parentNode = divElem.parentNode;
-    if (!parentNode.classList.contains('nflxmultisubs-primary-wrapper')) {
+    if (!parentNode.classList.contains("nflxmultisubs-primary-wrapper")) {
       // let's use `<style>` + `!imporant` to outrun the offical player...
-      const wrapper = document.createElement('div');
-      wrapper.classList.add('nflxmultisubs-primary-wrapper');
+      const wrapper = document.createElement("div");
+      wrapper.classList.add("nflxmultisubs-primary-wrapper");
       wrapper.style =
-        'position:absolute; width:100%; height:100%; top:0; left:0;';
+        "position:absolute; width:100%; height:100%; top:0; left:0;";
 
-      const styleElem = document.createElement('style');
+      const styleElem = document.createElement("style");
       wrapper.appendChild(styleElem);
 
       // wrap the offical text-based subtitle container, hehe!
@@ -825,7 +1033,9 @@ class PrimaryTextTransformer {
       parentNode = wrapper;
     }
 
-    const containers = divElem.querySelectorAll('.player-timedtext-text-container');
+    const containers = divElem.querySelectorAll(
+      ".player-timedtext-text-container"
+    );
     // select all elements to check if there are more than one later
     // but for now we only need the first one to attach our style
     const container = containers.item(0);
@@ -835,13 +1045,15 @@ class PrimaryTextTransformer {
     if (this.lastScaledPrimaryTextContent === textContent && !forced) return;
     this.lastScaledPrimaryTextContent = textContent;
 
-    const style = parentNode.querySelector('style');
+    const style = parentNode.querySelector("style");
     if (!style) return;
 
-    const textSpan = Array.from(container.querySelectorAll('span'));
+    const textSpan = Array.from(container.querySelectorAll("span"));
     if (!textSpan) return;
 
-    const fontSize = parseInt(textSpan.find(t => t.style.fontSize).style.fontSize);
+    const fontSize = parseInt(
+      textSpan.find((t) => t.style.fontSize).style.fontSize
+    );
     if (!fontSize) return;
 
     const options = gRenderOptions;
@@ -872,7 +1084,7 @@ class PrimaryTextTransformer {
     if (containers.length == 1) {
       style.textContent +=
         styleText +
-        '\n' +
+        "\n" +
         `
       .player-timedtext-text-container {
         top: ${newTop}px !important;
@@ -904,21 +1116,24 @@ class RendererLoop {
   start() {
     this.isRunning = true;
     window.requestAnimationFrame(this.loop.bind(this));
-    if (BROWSER !== 'firefox') {
+    if (BROWSER !== "firefox") {
       try {
         getMsgPort().postMessage({ startPlayback: 1 });
       } catch (err) {
-        console.warn('Cannot dispatch start playback,', err);
+        console.warn("Cannot dispatch start playback,", err);
       }
     } else {
       // Firefox
       try {
-        window.postMessage({
-          namespace: 'nflxmultisubs',
-          action: 'startPlayback'
-        }, '*');
+        window.postMessage(
+          {
+            namespace: "nflxmultisubs",
+            action: "startPlayback",
+          },
+          "*"
+        );
       } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
+        console.warn("Error: cannot talk to background,", err);
       }
     }
   }
@@ -926,43 +1141,47 @@ class RendererLoop {
   stop() {
     this.isRunning = false;
     this._clearSecondarySubtitles();
-    if (BROWSER !== 'firefox') {
+    if (BROWSER !== "firefox") {
       try {
         getMsgPort().postMessage({ stopPlayback: 1 });
-      }
-      catch (err) {
-        console.warn('Cannot dispatch stop playback,', err);
+      } catch (err) {
+        console.warn("Cannot dispatch stop playback,", err);
       }
     } else {
       // Firefox
       try {
-        window.postMessage({
-          namespace: 'nflxmultisubs',
-          action: 'stopPlayback'
-        }, '*');
+        window.postMessage(
+          {
+            namespace: "nflxmultisubs",
+            action: "stopPlayback",
+          },
+          "*"
+        );
       } catch (err) {
-        console.warn('Error: cannot talk to background,', err);
+        console.warn("Error: cannot talk to background,", err);
       }
     }
   }
 
-  loop() {
+  async loop() {
     try {
-      this._loop();
+      await this._loop();
       this.isRunning && window.requestAnimationFrame(this.loop.bind(this));
-    }
-    catch (err) {
-      console.error('Fatal: ', err);
+    } catch (err) {
+      console.error("Fatal: ", err);
     }
   }
 
-  _loop() {
-    const currentVideoElem = document.querySelector('#appMountPoint video');
+  async _loop() {
+    const currentVideoElem = document.querySelector("#appMountPoint video");
 
     // stop the render loop if there is no videoplayer (e.g.: user is on the homepage)
-    if (!currentVideoElem && !/netflix\..*\/watch/i.test(window.location.href)) {
+    if (
+      !currentVideoElem &&
+      !/netflix\..*\/watch/i.test(window.location.href)
+    ) {
       this.stop();
-      window.__NflxMultiSubs.lastMovieId = undefined // clear this in case the same show is started again later
+      window.__NflxMultiSubs.lastMovieId = undefined; // clear this in case the same show is started again later
       return;
     }
 
@@ -986,14 +1205,14 @@ class RendererLoop {
     }
 
     this._adjustPrimarySubtitles(controlsActive, !!this.isRenderDirty);
-    this._renderSecondarySubtitles();
+    await this._renderSecondarySubtitles();
 
     // render secondary subtitles
     // ---------------------------------------------------------------------
     // FIXME: dirty transform & magic offets
     // this leads to a big gap between primary & secondary subtitles
     // when the progress bar is shown
-    this.subtitleWrapperElem.style.top = controlsActive ? '-100px' : '0';
+    this.subtitleWrapperElem.style.top = controlsActive ? "-100px" : "0";
 
     // everything rendered, clear the dirty bit with ease
     this.isRenderDirty = false;
@@ -1002,10 +1221,12 @@ class RendererLoop {
   _getControlsActive() {
     // FIXME: better solution to handle different versions of Netflix web player UI
     // "Neo Style" refers to the newer version as in 2018/07
-    let controlsElem = document.querySelector('.controls, div[data-uia="controls-standard"], .watch-video--bottom-controls-container'),
+    let controlsElem = document.querySelector(
+        '.controls, div[data-uia="controls-standard"], .watch-video--bottom-controls-container'
+      ),
       neoStyle = false;
     if (!controlsElem) {
-      controlsElem = document.querySelector('.PlayerControlsNeo__layout');
+      controlsElem = document.querySelector(".PlayerControlsNeo__layout");
       if (!controlsElem) {
         return false;
       }
@@ -1018,7 +1239,7 @@ class RendererLoop {
 
     if (neoStyle) {
       return !controlsElem.classList.contains(
-        'PlayerControlsNeo__layout--inactive'
+        "PlayerControlsNeo__layout--inactive"
       );
     }
     return controlsElem !== null;
@@ -1027,7 +1248,9 @@ class RendererLoop {
   // @returns {boolean} Successed?
   _appendSubtitleWrapper() {
     if (!this.subtitleWrapperElem || !this.subtitleWrapperElem.parentNode) {
-      const playerContainerElem = document.querySelector('div[data-uia="video-canvas"]');
+      const playerContainerElem = document.querySelector(
+        'div[data-uia="video-canvas"]'
+      );
       if (!playerContainerElem) return false;
       this.subtitleWrapperElem = buildSecondarySubtitleElement(gRenderOptions);
       playerContainerElem.appendChild(this.subtitleWrapperElem);
@@ -1042,15 +1265,23 @@ class RendererLoop {
     // when the langauge of primary subtitles is switched.
     const force = this.lastControlsActive !== active;
     const primaryImageSubSvg = document.querySelector(
-      '.image-based-subtitles svg'
+      ".image-based-subtitles svg"
     );
     if (primaryImageSubSvg) {
-      this.primaryImageTransformer.transform(primaryImageSubSvg, active, dirty || force);
+      this.primaryImageTransformer.transform(
+        primaryImageSubSvg,
+        active,
+        dirty || force
+      );
     }
 
-    const primaryTextSubDiv = document.querySelector('.player-timedtext');
+    const primaryTextSubDiv = document.querySelector(".player-timedtext");
     if (primaryTextSubDiv) {
-      this.primaryTextTransformer.transform(primaryTextSubDiv, active, dirty || force);
+      this.primaryTextTransformer.transform(
+        primaryTextSubDiv,
+        active,
+        dirty || force
+      );
     }
 
     this.lastControlsActive = active;
@@ -1058,16 +1289,17 @@ class RendererLoop {
 
   _clearSecondarySubtitles() {
     if (!this.subSvg || !this.subSvg.parentNode) return;
-    [].forEach.call(this.subSvg.querySelectorAll('*'), elem =>
-      elem.parentNode.removeChild(elem));
+    [].forEach.call(this.subSvg.querySelectorAll("*"), (elem) =>
+      elem.parentNode.removeChild(elem)
+    );
   }
 
-  _renderSecondarySubtitles() {
+  async _renderSecondarySubtitles() {
     if (!this.subSvg || !this.subSvg.parentNode) {
-      this.subSvg = this.subtitleWrapperElem.querySelector('svg');
+      this.subSvg = this.subtitleWrapperElem.querySelector("svg");
     }
     const seconds = this.videoElem.currentTime;
-    const sub = gSubtitles.find(sub => sub.active);
+    const sub = gSubtitles.find((sub) => sub.active);
     if (!sub) {
       return;
     }
@@ -1077,42 +1309,47 @@ class RendererLoop {
       sub.setExtent(rect.width, rect.height);
     }
 
-    const renderedElems = sub.render(
-      seconds,
-      gRenderOptions,
-      !!this.isRenderDirty
-    );
+    // LLM 번역 활성화 시 비동기 렌더링 사용
+    let renderedElems;
+    if (LLM_ENABLED && sub instanceof TextSubtitle) {
+      renderedElems = await sub.renderWithTranslation(
+        seconds,
+        gRenderOptions,
+        !!this.isRenderDirty
+      );
+    } else {
+      renderedElems = sub.render(seconds, gRenderOptions, !!this.isRenderDirty);
+    }
+
     if (renderedElems) {
       const [extentWidth, extentHeight] = sub.getExtent();
       if (extentWidth && extentHeight) {
         this.subSvg.setAttribute(
-          'viewBox',
+          "viewBox",
           `0 0 ${extentWidth} ${extentHeight}`
         );
       }
       this._clearSecondarySubtitles();
-      renderedElems.forEach(elem => this.subSvg.appendChild(elem));
+      renderedElems.forEach((elem) => this.subSvg.appendChild(elem));
     }
   }
 }
 
-window.addEventListener('resize', evt => {
+window.addEventListener("resize", (evt) => {
   gRendererLoop && gRendererLoop.setRenderDirty();
   console.log(
-    'Resize:',
+    "Resize:",
     `${window.innerWidth}x${window.innerHeight} (${evt.timeStamp})`
   );
 });
 
-
 // -----------------------------------------------------------------------------
 
 class ManifestManagerBase {
-  enumManifest() { }
-  getManifest(movieId) { }
-  saveManifest(manifest) { }
+  enumManifest() {}
+  getManifest(movieId) {}
+  saveManifest(manifest) {}
 }
-
 
 class ManifestManagerInMemory extends ManifestManagerBase {
   constructor(...args) {
@@ -1136,7 +1373,7 @@ class ManifestManagerInMemory extends ManifestManagerBase {
 class ManifestManagerLocalStorage extends ManifestManagerBase {
   enumManifests() {
     return Object.entries(window.localStorage).filter((key, val) => {
-      return key.indexOf('manifest=') == 0;
+      return key.indexOf("manifest=") == 0;
     });
   }
 
@@ -1154,14 +1391,15 @@ class ManifestManagerLocalStorage extends ManifestManagerBase {
 
   saveManifest(manifest) {
     const key = `manifest=${manifest.movieId}`;
-    window.localStorage.setItem(key, JSON.stringify({
-      manifest: manifest,
-      timestamp: new Date(),
-    }));
+    window.localStorage.setItem(
+      key,
+      JSON.stringify({
+        manifest: manifest,
+        timestamp: new Date(),
+      })
+    );
   }
 }
-
-
 
 const extractMovieIdFromUrl = () => {
   const isInPlayerPage = /netflix\.com\/watch/i.test(window.location.href);
@@ -1173,8 +1411,7 @@ const extractMovieIdFromUrl = () => {
     const movieIdInUrl = /^\/watch\/(\d+)/.exec(window.location.pathname)[1];
     const movieId = parseInt(movieIdInUrl);
     return movieId;
-  }
-  catch (err) {
+  } catch (err) {
     console.error(err);
   }
   return null;
@@ -1188,7 +1425,7 @@ class NflxMultiSubsManager {
     this.playerVersion = undefined;
     this.busyWaitTimeout = 100000; // ms
     this.manifestManager = new ManifestManagerInMemory();
-    console.log(`Version: ${this.version}`)
+    console.log(`Version: ${this.version}`);
   }
 
   busyWaitVideoElement() {
@@ -1196,7 +1433,7 @@ class NflxMultiSubsManager {
     return new Promise((resolve, _) => {
       let timer = 0;
       const intervalId = setInterval(() => {
-        const video = document.querySelector('#appMountPoint video');
+        const video = document.querySelector("#appMountPoint video");
         if (video) {
           clearInterval(intervalId);
           resolve(video);
@@ -1221,23 +1458,27 @@ class NflxMultiSubsManager {
     if (!movieIdInUrl) return;
 
     if (movieIdInUrl != manifest.movieId) {
-      console.log(`Different manifest, movieIdInUrl=${movieIdInUrl}, manifest.movieId=${manifest.movieId}`);
+      console.log(
+        `Different manifest, movieIdInUrl=${movieIdInUrl}, manifest.movieId=${manifest.movieId}`
+      );
       return;
     }
 
     // Sometime the movieId in URL may be different to the actually playing manifest
     // Thus we also need to check the player DOM tree...
     this.busyWaitVideoElement()
-      .then(video => {
+      .then((video) => {
         try {
           const movieIdInUrl = extractMovieIdFromUrl();
-          let playingManifest = (manifest.movieId === movieId);
+          let playingManifest = manifest.movieId === movieId;
 
           if (!playingManifest) {
             // magic! ... div.VideoContainer > div#12345678 > video[src=blob:...]
             const movieIdInPlayerNode = video.parentNode.id;
             console.log(`Note: movieIdInPlayerNode=${movieIdInPlayerNode}`);
-            playingManifest = movieIdInPlayerNode.includes(manifest.movieId.toString());
+            playingManifest = movieIdInPlayerNode.includes(
+              manifest.movieId.toString()
+            );
           }
 
           if (!playingManifest) {
@@ -1249,61 +1490,88 @@ class NflxMultiSubsManager {
 
           const movieChanged = manifest.movieId !== this.lastMovieId;
           if (!movieChanged) {
-            updateSubtitleList(manifest.timedtexttracks, manifest.recommendedMedia.timedTextTrackId);
+            updateSubtitleList(
+              manifest.timedtexttracks,
+              manifest.recommendedMedia.timedTextTrackId
+            );
             console.log(`Manifest ${manifest.movieId} updated`);
             return;
           }
 
-          console.log(`Activating manifest ${manifest.movieId} (last=${this.lastMovieId})`);
+          console.log(
+            `Activating manifest ${manifest.movieId} (last=${this.lastMovieId})`
+          );
           this.lastMovieId = manifest.movieId;
 
           // For cadmium-playercore-6.0012.183.041.js and later
           gSubtitles = buildSubtitleList(manifest.timedtexttracks);
 
           // select subtitle based on language settings
-          console.log('Language mode: ', gRenderOptions.secondaryLanguageMode);
+          console.log("Language mode: ", gRenderOptions.secondaryLanguageMode);
           switch (String(gRenderOptions.secondaryLanguageMode)) {
-            case 'disabled':
-              console.log('Subs disabled.');
+            case "disabled":
+              console.log("Subs disabled.");
               break;
             default:
-            case 'audio':
+            case "audio":
               try {
                 // There is also manifest.recommendedMedia.audioTrackId, but it just points to the track with isNative == true
-                const defaultAudioTrack = manifest.audio_tracks.find(t => t.isNative == true);
-                const defaultAudioLanguage = (defaultAudioTrack) ? defaultAudioTrack.language : manifest.audio_tracks[0].language; // fall back to first track if isNative fails
-                console.log(`Default audio track language: ${defaultAudioLanguage}`);
-                const autoSubtitleId = gSubtitles.findIndex(t => t.bcp47 == defaultAudioLanguage);
+                const defaultAudioTrack = manifest.audio_tracks.find(
+                  (t) => t.isNative == true
+                );
+                const defaultAudioLanguage = defaultAudioTrack
+                  ? defaultAudioTrack.language
+                  : manifest.audio_tracks[0].language; // fall back to first track if isNative fails
+                console.log(
+                  `Default audio track language: ${defaultAudioLanguage}`
+                );
+                const autoSubtitleId = gSubtitles.findIndex(
+                  (t) => t.bcp47 == defaultAudioLanguage
+                );
                 if (autoSubtitleId >= 0) {
-                  console.log(`Subtitle #${autoSubtitleId} auto-enabled to match audio`);
+                  console.log(
+                    `Subtitle #${autoSubtitleId} auto-enabled to match audio`
+                  );
                   activateSubtitle(autoSubtitleId);
                 } else {
-                  console.log(defaultAudioLanguage + ' subs not available.');
+                  console.log(defaultAudioLanguage + " subs not available.");
                 }
-              }
-              catch (err) {
-                console.error('Default audio track not found, ', err);
+              } catch (err) {
+                console.error("Default audio track not found, ", err);
               }
               break;
-            case 'last':
+            case "last":
               if (gRenderOptions.secondaryLanguageLastUsed) {
-                console.log('Activating last sub language', gRenderOptions.secondaryLanguageLastUsed)
+                console.log(
+                  "Activating last sub language",
+                  gRenderOptions.secondaryLanguageLastUsed
+                );
                 try {
-                  let lastSubtitleId = gSubtitles.findIndex(t => (t.bcp47 == gRenderOptions.secondaryLanguageLastUsed && t.isCaption == gRenderOptions.secondaryLanguageLastUsedIsCaption));
+                  let lastSubtitleId = gSubtitles.findIndex(
+                    (t) =>
+                      t.bcp47 == gRenderOptions.secondaryLanguageLastUsed &&
+                      t.isCaption ==
+                        gRenderOptions.secondaryLanguageLastUsedIsCaption
+                  );
                   // if can't match CC type, fall back to language only
                   if (lastSubtitleId == -1)
-                    lastSubtitleId = gSubtitles.findIndex(t => t.bcp47 == gRenderOptions.secondaryLanguageLastUsed);
+                    lastSubtitleId = gSubtitles.findIndex(
+                      (t) => t.bcp47 == gRenderOptions.secondaryLanguageLastUsed
+                    );
                   if (lastSubtitleId >= 0) {
                     console.log(`Subtitle #${lastSubtitleId} enabled`);
                     activateSubtitle(lastSubtitleId);
                   } else {
-                    console.log(gRenderOptions.secondaryLanguageLastUsed + ' subs not available.');
+                    console.log(
+                      gRenderOptions.secondaryLanguageLastUsed +
+                        " subs not available."
+                    );
                   }
                 } catch (err) {
-                  console.error('Error activating last sub language, ', err);
+                  console.error("Error activating last sub language, ", err);
                 }
               } else {
-                console.log('Last used language is empty, subs disabled.');
+                console.log("Last used language is empty, subs disabled.");
               }
               break;
           }
@@ -1312,42 +1580,41 @@ class NflxMultiSubsManager {
           try {
             let { maxWidth, maxHeight } = manifest.video_tracks[0];
             gVideoRatio = maxHeight / maxWidth;
+          } catch (err) {
+            console.error("Video ratio not available, ", err);
           }
-          catch (err) {
-            console.error('Video ratio not available, ', err);
-          }
-        }
-        catch (err) {
-          console.error('Fatal: ', err);
+        } catch (err) {
+          console.error("Fatal: ", err);
         }
 
         if (gRendererLoop) {
           gRendererLoop.stop();
           gRendererLoop = null;
-          console.log('Terminated: old renderer loop');
+          console.log("Terminated: old renderer loop");
         }
 
         if (!gRendererLoop) {
           gRendererLoop = new RendererLoop(video);
           gRendererLoop.start();
-          console.log('Started: renderer loop');
+          console.log("Started: renderer loop");
         }
 
         // detect for newer version of Netflix web player UI
-        const hasNeoStyleControls = !!document.querySelector('[class*=PlayerControlsNeo]');
+        const hasNeoStyleControls = !!document.querySelector(
+          "[class*=PlayerControlsNeo]"
+        );
         console.log(`hasNeoStyleControls: ${hasNeoStyleControls}`);
       })
-      .catch(err => {
-        console.error('Fatal: ', err);
+      .catch((err) => {
+        console.error("Fatal: ", err);
       });
   }
 
   updateManifest(manifest) {
     try {
       console.log(`Intecerpted manifest: ${manifest.movieId}`);
-    }
-    catch (err) {
-      console.warn('Error:', err);
+    } catch (err) {
+      console.warn("Error:", err);
     }
 
     this.manifestManager.saveManifest(manifest);
@@ -1367,24 +1634,32 @@ class NflxMultiSubsManager {
 // =============================================================================
 
 const nflxMultiSubsManager = new NflxMultiSubsManager();
-window.__NflxMultiSubs = nflxMultiSubsManager;  // interface between us and the the manifest hook
+window.__NflxMultiSubs = nflxMultiSubsManager; // interface between us and the the manifest hook
 
 // control video playback rate
 const playbackRateController = new PlaybackRateController();
 playbackRateController.activate();
 
-window.addEventListener('keydown', (event) => {
-  // toggle subtitles visibility with 'v'
-  if (event.key.toLowerCase() === 'v') {
-    const primary = document.querySelector('.nflxmultisubs-primary-wrapper');
-    const secondary = document.querySelector('.nflxmultisubs-subtitle-wrapper');
+window.addEventListener(
+  "keydown",
+  (event) => {
+    // toggle subtitles visibility with 'v'
+    if (event.key.toLowerCase() === "v") {
+      const primary = document.querySelector(".nflxmultisubs-primary-wrapper");
+      const secondary = document.querySelector(
+        ".nflxmultisubs-subtitle-wrapper"
+      );
 
-    if (!primary || !secondary)
-      return;
+      if (!primary || !secondary) return;
 
-    const visible = (window.getComputedStyle(primary).visibility === 'visible') ||
-      (window.getComputedStyle(secondary).visibility === 'visible');
+      const visible =
+        window.getComputedStyle(primary).visibility === "visible" ||
+        window.getComputedStyle(secondary).visibility === "visible";
 
-    primary.style.visibility = secondary.style.visibility = (visible) ? 'hidden' : 'visible';
-  }
-}, true);
+      primary.style.visibility = secondary.style.visibility = visible
+        ? "hidden"
+        : "visible";
+    }
+  },
+  true
+);
